@@ -1,0 +1,228 @@
+import os
+import cv2
+import numpy as np
+import torch
+import timm
+from torch import nn, optim
+from sklearn.metrics import accuracy_score
+from sklearn.preprocessing import normalize
+import matplotlib.pyplot as plt
+
+# Load images from a folder
+def load_images_from_folder(folder):
+    images = []
+    filenames = os.listdir(folder)
+    print(f"Loading images from {folder}, found {len(filenames)} files.")
+    for filename in filenames:
+        img = cv2.imread(os.path.join(folder, filename))
+        if img is not None:
+            img = cv2.resize(img, (224, 224))
+            images.append(img)
+    images = np.array(images)
+    images = torch.tensor(images).permute(0, 3, 1, 2).float() / 255.0  # Convert to tensor and normalize
+    return images
+
+# Load pre-trained DINOv2 model
+model_name = 'vit_base_patch16_224'
+model = timm.create_model(model_name, pretrained=True)
+model.eval()
+
+# Paths for datasets
+vangogh_train_path = '/content/drive/My Drive/AI Art/VanGogh/trainV/'
+plagiarized_train_path = '/content/drive/My Drive/AI Art/Plag/trainP/'
+negative_train_path = '/content/drive/My Drive/AI Art/Negative/trainN/'
+
+# Load data
+vangogh_train = load_images_from_folder(vangogh_train_path)
+plagiarized_train = load_images_from_folder(plagiarized_train_path)
+negative_train = load_images_from_folder(negative_train_path)
+
+# Feature extraction function
+def extract_features(images, model):
+    with torch.no_grad():
+        features = model.forward_features(images)
+    return features.max(dim=1)[0]  # Return max pooled features
+
+# Extract features
+vangogh_features_train = extract_features(vangogh_train, model)
+plagiarized_features_train = extract_features(plagiarized_train, model)
+negative_features_train = extract_features(negative_train, model)
+
+# Normalize features
+vangogh_features_train = torch.nn.functional.normalize(vangogh_features_train, dim=1)
+plagiarized_features_train = torch.nn.functional.normalize(plagiarized_features_train, dim=1)
+negative_features_train = torch.nn.functional.normalize(negative_features_train, dim=1)
+
+# Sample triplets
+def sample_triplets(vangogh_features, plagiarized_features, negative_features, num_triplets):
+    triplets = []
+    for _ in range(num_triplets):
+        anchor = vangogh_features[np.random.randint(len(vangogh_features))]
+        positive = plagiarized_features[np.random.randint(len(plagiarized_features))]
+        negative = negative_features[np.random.randint(len(negative_features))]
+        triplets.append((anchor, positive, negative))
+    return triplets
+
+num_triplets = 300
+triplets = sample_triplets(vangogh_features_train, plagiarized_features_train, negative_features_train, num_triplets)
+
+# Convert triplets to tensors
+anchor_data = torch.stack([triplet[0] for triplet in triplets])
+positive_data = torch.stack([triplet[1] for triplet in triplets])
+negative_data = torch.stack([triplet[2] for triplet in triplets])
+
+# Training loop with Triplet and Contrastive Loss
+class ContrastiveLoss(nn.Module):
+    def __init__(self, margin=1.0):
+        super(ContrastiveLoss, self).__init__()
+        self.margin = margin
+
+    def forward(self, output1, output2, label):
+        distance = torch.norm(output1 - output2, dim=1)
+        loss = label * torch.pow(distance, 2) + (1 - label) * torch.pow(torch.clamp(self.margin - distance, min=0.0), 2)
+        return torch.mean(loss)
+
+contrastive_loss_fn = ContrastiveLoss(margin=1.0)
+triplet_loss_fn = nn.TripletMarginLoss(margin=1.0)
+optimizer = optim.Adam(model.blocks[-1].parameters(), lr=1e-4)
+
+lambda_weight = 0.5
+training_losses = []
+
+# Training process
+for epoch in range(10):
+    model.train()
+    optimizer.zero_grad()
+
+    # Forward pass
+    anchor_emb = model(anchor_data)
+    positive_emb = model(positive_data)
+    negative_emb = model(negative_data)
+
+    # Compute losses
+    triplet_loss = triplet_loss_fn(anchor_emb, positive_emb, negative_emb)
+    positive_labels = torch.ones(len(anchor_emb))
+    negative_labels = torch.zeros(len(anchor_emb))
+    contrastive_loss_pos = contrastive_loss_fn(anchor_emb, positive_emb, positive_labels)
+    contrastive_loss_neg = contrastive_loss_fn(anchor_emb, negative_emb, negative_labels)
+    contrastive_loss = (contrastive_loss_pos + contrastive_loss_neg) / 2
+
+    # Combine losses
+    total_loss = lambda_weight * triplet_loss + (1 - lambda_weight) * contrastive_loss
+
+    # Backpropagation
+    total_loss.backward()
+    optimizer.step()
+
+    # Log the loss
+    training_losses.append(total_loss.item())
+    print(f"Epoch {epoch + 1}/10, Triplet Loss: {triplet_loss.item():.4f}, Contrastive Loss: {contrastive_loss.item():.4f}, Total Loss: {total_loss.item():.4f}")
+
+# Plot training losses
+plt.figure(figsize=(10, 6))
+plt.plot(range(1, len(training_losses) + 1), training_losses, marker='o')
+plt.title('Training Loss Curve')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.grid()
+plt.show()
+
+# Train an SVM classifier
+
+
+vangogh_features_train = extract_features(vangogh_train, model)
+plagiarized_features_train = extract_features(plagiarized_train, model)
+negative_features_train = extract_features(negative_train, model)
+
+# Normalize features
+vangogh_features_train = normalize(vangogh_features_train, axis=1)
+plagiarized_features_train = normalize(plagiarized_features_train, axis=1)
+negative_features_train = normalize(negative_features_train, axis=1)
+
+
+
+X_train = np.concatenate((vangogh_features_train, plagiarized_features_train, negative_features_train))
+y_train = np.concatenate((np.zeros(len(vangogh_features_train)),
+                          np.ones(len(plagiarized_features_train)),
+                          np.ones(len(negative_features_train))))
+svm_classifier = SVC(kernel='rbf', probability=True, random_state=42)
+
+svm_classifier.fit(X_train, y_train)
+
+
+vangogh_test = torch.tensor(load_images_from_folder(vangogh_test_path))
+plagiarized_test = torch.tensor(load_images_from_folder(plagiarized_test_path))
+negative_test = torch.tensor(load_images_from_folder(negative_test_path))
+
+
+vangogh_features_test = extract_features(vangogh_test, model)
+plagiarized_features_test = extract_features(plagiarized_test, model)
+negative_features_test = extract_features(negative_test, model)
+
+
+vangogh_features_test = normalize(vangogh_features_test, axis=1)
+plagiarized_features_test = normalize(plagiarized_features_test, axis=1)
+negative_features_test = normalize(negative_features_test, axis=1)
+
+
+
+# Classification for each simulation
+def evaluate_simulation(query_features, query_labels, simulation_type):
+    predictions = svm_classifier.predict(query_features)
+    accuracy = accuracy_score(query_labels, predictions)
+    print(f"{simulation_type} Accuracy: {accuracy * 100:.2f}% ({len(query_labels)} queries)")
+    return accuracy, len(query_labels)
+
+# Calculate accuracies for all cases
+vangogh_accuracy, vangogh_total = evaluate_simulation(
+    vangogh_features_test, np.zeros(len(vangogh_features_test)), "Van Gogh"
+)
+plagiarized_accuracy, plagiarized_total = evaluate_simulation(
+    plagiarized_features_test, np.ones(len(plagiarized_features_test)), "Plagiarized"
+)
+other_accuracy, other_total = evaluate_simulation(
+    negative_features_test, np.ones(len(negative_features_test)), "Other"
+)
+
+# Calculate total accuracy
+total_correct = vangogh_accuracy * vangogh_total + plagiarized_accuracy * plagiarized_total + other_accuracy * other_total
+total_queries = vangogh_total + plagiarized_total + other_total
+total_accuracy = total_correct / total_queries
+print(f"Total Accuracy: {total_accuracy * 100:.2f}% ({total_queries} queries)")
+
+# Calculate Mean Average Precision (mAP) using cosine similarity
+def calculate_map_cosine(X_test, y_test, vangogh_features_train, negative_features_train):
+    y_scores = []  # Similarity score differences
+    y_true = []    # True labels
+
+    for i, query in enumerate(X_test):
+        # Compute cosine similarity
+        cos_sim_vangogh = cosine_similarity([query], vangogh_features_train).max()
+        cos_sim_negative = cosine_similarity([query], negative_features_train).max()
+
+        # Append the difference as a confidence score
+        y_scores.append(cos_sim_vangogh - cos_sim_negative)
+        y_true.append(y_test[i])
+
+    # Compute precision-recall curve and mAP
+    precision, recall, _ = precision_recall_curve(y_true, y_scores)
+    mean_ap = auc(recall, precision)
+    print(f"Mean Average Precision (mAP) with Cosine Similarity: {mean_ap * 100:.2f}%")
+    return mean_ap
+
+# Call the function
+X_test = np.concatenate((vangogh_features_test, plagiarized_features_test, negative_features_test))
+y_test = np.concatenate((np.zeros(len(vangogh_features_test)),
+                         np.ones(len(plagiarized_features_test)),
+                         np.zeros(len(negative_features_test))))
+mean_ap = calculate_map_cosine(X_test, y_test, vangogh_features_train, negative_features_train)
+
+# Visualize Results
+def visualize_simulation(query_features, query_labels, simulation_type):
+    predictions = svm_classifier.predict(query_features)
+    for i in range(3):  # Visualize 3 random examples
+        print(f"Query {i+1} ({simulation_type}): Predicted: {'Yes' if predictions[i] == 1 else 'No'}, Expected: {'Yes' if query_labels[i] == 1 else 'No'}")
+
+visualize_simulation(vangogh_features_test, np.zeros(len(vangogh_features_test)), "Van Gogh")
+visualize_simulation(plagiarized_features_test, np.ones(len(plagiarized_features_test)), "Plagiarized")
+visualize_simulation(negative_features_test, np.zeros(len(negative_features_test)), "Other")
